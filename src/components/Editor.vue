@@ -13,7 +13,7 @@ import {
   GutterMarker,
 } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap, cursorCharLeft, cursorCharRight, cursorLineUp, cursorLineDown } from '@codemirror/commands'
-import { closeBrackets } from '@codemirror/autocomplete'
+import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 
 const props = defineProps<{
@@ -217,33 +217,90 @@ const lineMinimap = ViewPlugin.fromClass(class {
   decorations: () => Decoration.none,
 })
 
-// ── Tab 跳过闭合引号 ──────────────────────────────
-// ── 引号自动补全 ──────────────────────────────────
-// closeBrackets 处理英文（直接键盘输入）
-const bracketConfig = closeBrackets()
-// 中文引号补全（监听 compositionend，绕过 closeBrackets 的 compositionStarted 检查）
-const chineseAutoBracket = EditorView.domEventHandlers({
-  compositionend: (e: CompositionEvent, view: EditorView) => {
-    const text = e.data
-    if (!text || text.length !== 1) return
-    const pairs: Record<string, string> = { '\u201C': '\u201D', '\u300C': '\u300D', '\u3010': '\u3011' }
-    const close = pairs[text]
-    if (!close) return
-    setTimeout(() => {
-      const pos = view.state.selection.main.head
-      if (pos < 1) return
-      const prev = view.state.sliceDoc(pos - 1, pos)
-      if (prev !== text) return
-      const next = view.state.sliceDoc(pos, pos + 1)
-      if (!next || /[\s\u201D\u300D\u3011)\]}>]/.test(next)) {
-        view.dispatch({
-          changes: { from: pos, insert: close },
-          selection: { anchor: pos },
-        })
-      }
-    }, 0)
-  },
-})
+// ── 英文括号自动闭合（CM6 原生） ──────────────────
+const bracketAutoClose = [
+  closeBrackets(),
+  keymap.of(closeBracketsKeymap),
+]
+
+// ── 中文引号自动配对（裸 DOM 层操作，绕过 IME 状态机冲突） ──
+const QUOTE_PAIRS: Record<string, string> = {
+  '“': '”', '‘': '’', '「': '」', '『': '』',
+  '【': '】', '（': '）', '《': '》',
+  '”': '“', '’': '‘',
+}
+const LEFT_SIDE_QUOTES = ['”', '’']
+
+function getEventData(e: Event): string | null {
+  return (e as CompositionEvent).data ?? (e as InputEvent).data ?? null
+}
+
+function handleDOMQuote(e: Event) {
+  const target = e.target as HTMLElement
+  if (!target) return
+  const tag = target.tagName
+
+  if (e.type !== 'compositionend' && (e as InputEvent).inputType !== 'insertText') return
+
+  const data = getEventData(e)
+  if (!data) return
+  const pair = QUOTE_PAIRS[data]
+  if (!pair) return
+
+  if (tag === 'TEXTAREA' || tag === 'INPUT') {
+    handleInputQuote(target as HTMLInputElement | HTMLTextAreaElement, data, pair)
+  } else {
+    handleContentEditableQuote(data, pair)
+  }
+}
+
+function handleInputQuote(el: HTMLInputElement | HTMLTextAreaElement, data: string, pair: string) {
+  const isLeft = LEFT_SIDE_QUOTES.includes(data)
+  if (isLeft) {
+    el.setSelectionRange((el.selectionStart ?? 0) - 1, (el.selectionEnd ?? 0) - 1)
+  }
+
+  el.setRangeText(pair)
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+  ;(el as any).refreshSearch?.()
+
+  if (isLeft) {
+    el.setSelectionRange((el.selectionStart ?? 0) + 1, (el.selectionEnd ?? 0) + 1)
+  }
+}
+
+function handleContentEditableQuote(data: string, pair: string) {
+  const sel = document.getSelection()
+  if (!sel || sel.rangeCount === 0) return
+  const range = sel.getRangeAt(0)
+  const isLeft = LEFT_SIDE_QUOTES.includes(data)
+
+  if (isLeft) {
+    const { startContainer, startOffset, endContainer, endOffset } = range
+    range.setStart(startContainer, startOffset - 1)
+    range.setEnd(endContainer, endOffset - 1)
+  }
+
+  const textNode = document.createTextNode(pair)
+  range.insertNode(textNode)
+
+  if (isLeft) {
+    range.setStartAfter(textNode)
+  } else {
+    range.setEndBefore(textNode)
+  }
+  range.commonAncestorContainer.normalize()
+}
+
+function startDOMQuoteHandler() {
+  document.addEventListener('compositionend', handleDOMQuote)
+  document.addEventListener('input', handleDOMQuote as EventListener)
+}
+
+function stopDOMQuoteHandler() {
+  document.removeEventListener('compositionend', handleDOMQuote)
+  document.removeEventListener('input', handleDOMQuote as EventListener)
+}
 
 // ── 回车自动滚动 ──────────────────────────────────
 const autoScrollOnEnter = keymap.of([{
@@ -389,8 +446,7 @@ function createEditor(docContent?: string) {
       autoScrollOnEnter,
       emptyBackspaceKeymap,
       saveKeymap,
-      bracketConfig,
-      chineseAutoBracket,
+      ...bracketAutoClose,
       // 过滤掉 defaultKeymap 中的 Mod-i（selectParentSyntax），避免和我们的 Ctrl-i 冲突
       keymap.of(defaultKeymap.filter(b => b.key !== 'Mod-i')),
       keymap.of(historyKeymap),
@@ -421,6 +477,7 @@ function createEditor(docContent?: string) {
 }
 
 onMounted(() => {
+  startDOMQuoteHandler()
   createEditor()
   // 容器被点击时强制聚焦 CM6，避免焦点落到标题 input
   editorRef.value?.addEventListener('mousedown', (e: MouseEvent) => {
@@ -430,7 +487,10 @@ onMounted(() => {
     }
   })
 })
-onUnmounted(() => { viewRef.value?.destroy() })
+onUnmounted(() => {
+  stopDOMQuoteHandler()
+  viewRef.value?.destroy()
+})
 
 // 监听设置变化，重建编辑器
 watch([() => props.fontSize, () => props.lineHeight, () => props.paragraphSpacing, () => props.showLineNumbers], () => {
